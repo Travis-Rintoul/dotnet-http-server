@@ -31,7 +31,7 @@ public class HttpRequestReader
                 received.AddRange(buffer.AsSpan(0, result).ToArray());
 
                 if (received.Count >= MaxHeaderSize)
-                {\
+                {
                     throw new InvalidOperationException($"Headers too large (> {MaxHeaderSize} bytes).");
                 }
                 
