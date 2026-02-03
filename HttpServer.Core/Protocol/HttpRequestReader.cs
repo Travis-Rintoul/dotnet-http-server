@@ -1,126 +1,102 @@
 using System.Buffers;
 using System.Net.Sockets;
 using System.Text;
+using FluentResults;
+using HttpServer.Core.Errors;
+using HttpServer.Core.Models;
 using static HttpServer.Core.Constants.HeaderConstants;
 
 namespace HttpServer.Core.Protocol;
 
-public class HttpRequestReader
+public class HttpRequestReader(HttpLimits limits)
 {
-    private const int MaxHeaderSize = 64 * 1024;
     private const int ReadBufferSize = 8 * 1024;
-    
-    public static async Task<(string startLine, Dictionary<string,string> headers, byte[] body)>  ReadAsync(NetworkStream stream, CancellationToken cancellationToken)
+
+    public async Task<Result<HttpRequestFrame>> ReadHeaderAsync(NetworkStream stream, CancellationToken cancellationToken)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(ReadBufferSize);
+        byte[] readBuffer = ArrayPool<byte>.Shared.Rent(ReadBufferSize);
+        byte[] headerBuffer = ArrayPool<byte>.Shared.Rent(limits.MaxHeaderBytes);
+
+        int headerCount = 0;
+        int matched = 0;
 
         try
         {
-            var headerEndIndex = -1;
-            var received = new List<byte>(ReadBufferSize);
-
-            // Read until terminator
-            while (headerEndIndex < 0)
+            while (true)
             {
-                int result = await stream.ReadAsync(buffer.AsMemory(0, ReadBufferSize), cancellationToken);
-                if (result == 0)
+                int read = await stream.ReadAsync(readBuffer.AsMemory(0, ReadBufferSize), cancellationToken);
+                if (read == 0)
+                    Result.Fail(new ClientDisconnectedError());
+
+                for (int i = 0; i < read; i++)
                 {
-                    throw new IOException("Client disconnected while reading headers.");
+                    if (headerCount >= limits.MaxBodyBytes)
+                        return Result.Fail(new HeaderTooLargeError(limits.MaxHeaderBytes));
+                    
+                    byte readByte = readBuffer[i];
+                    headerBuffer[headerCount++] = readByte;
+                    
+                    matched = readByte switch
+                    {
+                        (byte)'\r' when matched is 0 or 2 => matched + 1,
+                        (byte)'\n' when matched is 1 or 3 => matched + 1,
+                        _ => 0
+                    };
+
+                    if (matched == 4)
+                    {
+                        var headers = headerBuffer[..headerCount].ToArray();
+                        var remainder = read > i + 1
+                            ? readBuffer[(i + 1)..read].ToArray()
+                            : [];
+
+                        return Result.Ok(new HttpRequestFrame(headers, remainder));
+                    }
                 }
-                
-                received.AddRange(buffer.AsSpan(0, result).ToArray());
-
-                if (received.Count >= MaxHeaderSize)
-                {
-                    throw new InvalidOperationException($"Headers too large (> {MaxHeaderSize} bytes).");
-                }
-                
-                headerEndIndex = HttpRequestReader.IndexOfHeaderTerminator(received);
-            } /* while (headerEndIndex < 0) */
-
-            int headersLength = headerEndIndex + 4;
-            byte[] headerBytes = received.GetRange(0, headersLength).ToArray();
-            byte[] remainder = received.Count > headersLength
-                ? received.GetRange(headersLength, received.Count - headersLength).ToArray()
-                : Array.Empty<byte>();
-
-            var headerText = Encoding.ASCII.GetString(headerBytes);
-            var lines = headerText.Split("\r\n", StringSplitOptions.None);
-
-            string startLine = lines[0];
-            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-            for (int i = 1; i < lines.Length; i++)
-            {
-                var line = lines[i];
-                if (line.Length == 0)
-                {
-                    break;
-                }
-
-                int colon = line.IndexOf(':');
-                if (colon <= 0)
-                {
-                    continue;
-                }
-                
-                string name = line[..colon].Trim();
-                string value = line[(colon + 1)..].Trim();
-
-                headers[name] = value;
-            } /* for (int i = 1; i < lines.Length; i++) */
-            
-            int contentLength = 0;
-            if (headers.TryGetValue(ContentLength, out var contentLenghtString) && 
-                int.TryParse(contentLenghtString, out var contentLengthInt))
-            {
-                contentLength = contentLengthInt;
             }
-
-            if (headers.TryGetValue(TransferEncoding, out var transferEncodingString) &&
-                transferEncodingString.Contains("chunked", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new NotSupportedException("chunked request bodies not supported yet.");
-            }
-            
-            byte[] body = new Byte[contentLength];
-            int copied = 0;
-            
-            int take = Math.Min(remainder.Length, contentLength);
-            if (take > 0)
-            {
-                Buffer.BlockCopy(remainder, 0, body, 0, take);
-                copied += take;
-            }
-
-            while (copied < contentLength)
-            {
-                int result = await stream.ReadAsync(body.AsMemory(copied, contentLength - copied), cancellationToken);
-                if (result == 0)
-                {
-                    throw new IOException("Client disconnected while reading body.");
-                }
-                
-                copied += result;
-            }
-            
-            return (startLine, headers, body);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            ArrayPool<byte>.Shared.Return(readBuffer);
+            ArrayPool<byte>.Shared.Return(headerBuffer);
         }
     }
-    
-    private static int IndexOfHeaderTerminator(List<byte> data)
+
+    public async Task<Result<Stream>> ReadBodyAsync(
+        NetworkStream stream,
+        BodyDescriptor body,
+        byte[] remainder,
+        CancellationToken cancellationToken)
     {
-        // Find \r\n\r\n
-        for (int i = 0; i <= data.Count - 4; i++)
+        if (body is NoBody)
+            return Result.Ok(Stream.Null);
+
+        if (body is not ContentLengthBody contentLengthValue)
+            return Result.Fail("Unsupported body type.");
+        
+        if (contentLengthValue.Length > limits.MaxBodyBytes)
+            return Result.Fail("Request body is too large");
+        
+        var memoryStream = new MemoryStream((int)contentLengthValue.Length);
+
+        int taken = Math.Min(remainder.Length, (int)contentLengthValue.Length);
+        if (taken > 0)
+            await memoryStream.WriteAsync(remainder.AsMemory(0, taken), cancellationToken);
+
+        long remaining = contentLengthValue.Length - taken;
+        while (remaining > 0)
         {
-            if (data[i] == (byte)'\r' && data[i + 1] == (byte)'\n' &&
-                data[i + 2] == (byte)'\r' && data[i + 3] == (byte)'\n')
-                return i;
+            int read = await stream.ReadAsync(memoryStream.GetBuffer()
+                .AsMemory((int)memoryStream.Position, (int)remaining), cancellationToken);
+            
+            if (read == 0)
+                return Result.Fail(new ClientDisconnectedError());
+            
+            memoryStream.Position += read;
+            remaining -= read;
         }
-        return -1;
+        
+        memoryStream.Position = 0;
+        return Result.Ok<Stream>(memoryStream);
     }
 }
