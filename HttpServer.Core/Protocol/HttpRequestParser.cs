@@ -5,10 +5,11 @@ using FluentResults;
 using HttpServer.Core.Constants;
 using HttpServer.Core.Errors;
 using HttpServer.Core.Models;
+using HttpServer.Core.Transport;
 
 namespace HttpServer.Core.Protocol;
 
-public class HttpRequestParser(HttpLimits limits)
+public class HttpRequestParser(HttpLimits limits) : IHttpRequestParser
 {
     public Result<HttpRequestHead> ParseHeader(ReadOnlySpan<byte> headerBytes)
     {
@@ -23,7 +24,7 @@ public class HttpRequestParser(HttpLimits limits)
 
         if (requestLine.Length > limits.MaxRequestLineBytes)
             return Result.Fail(new InvalidRequestError("Request line too long."));
-
+        
         var parts = requestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length != 3)
             return Result.Fail(new InvalidRequestError("Invalid request line."));
@@ -91,7 +92,7 @@ public class HttpRequestParser(HttpLimits limits)
                 method,
                 target,
                 version,
-                headers,
+                new HttpHeaders(headers),
                 body));
     }
 }

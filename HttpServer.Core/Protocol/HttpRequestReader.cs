@@ -8,7 +8,7 @@ using static HttpServer.Core.Constants.HeaderConstants;
 
 namespace HttpServer.Core.Protocol;
 
-public class HttpRequestReader(HttpLimits limits)
+public class HttpRequestReader(HttpLimits limits) : IHttpRequestReader
 {
     private const int ReadBufferSize = 8 * 1024;
 
